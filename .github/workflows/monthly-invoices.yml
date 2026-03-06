@@ -1,0 +1,53 @@
+name: Monthly Google Ads Invoices
+
+on:
+  # Runs on the 5th of every month at 07:00 UTC
+  # (giving Google Ads time to generate the previous month's invoices)
+  schedule:
+    - cron: "0 7 5 * *"
+
+  # Allow manual trigger from the GitHub Actions UI
+  workflow_dispatch:
+
+jobs:
+  send-invoices:
+    name: Fetch & Email Invoices
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch invoices and send email
+        env:
+          # ── Google Ads API ────────────────────────────────────────────────
+          # Comma-separated customer IDs, e.g. "1234567890,9876543210"
+          GOOGLE_ADS_CUSTOMER_IDS: ${{ secrets.GOOGLE_ADS_CUSTOMER_IDS }}
+
+          # Google Ads OAuth2 / service credentials (google-ads.yaml fields as env vars)
+          GOOGLE_ADS_DEVELOPER_TOKEN: ${{ secrets.GOOGLE_ADS_DEVELOPER_TOKEN }}
+          GOOGLE_ADS_CLIENT_ID: ${{ secrets.GOOGLE_ADS_CLIENT_ID }}
+          GOOGLE_ADS_CLIENT_SECRET: ${{ secrets.GOOGLE_ADS_CLIENT_SECRET }}
+          GOOGLE_ADS_REFRESH_TOKEN: ${{ secrets.GOOGLE_ADS_REFRESH_TOKEN }}
+          # Optional – only if you use a Manager (MCC) account for auth
+          # GOOGLE_ADS_LOGIN_CUSTOMER_ID: ${{ secrets.GOOGLE_ADS_LOGIN_CUSTOMER_ID }}
+
+          # ── Gmail API ─────────────────────────────────────────────────────
+          GMAIL_CREDENTIALS_JSON: ${{ secrets.GMAIL_CREDENTIALS_JSON }}
+          GMAIL_TOKEN_JSON: ${{ secrets.GMAIL_TOKEN_JSON }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+
+          # ── Recipient ─────────────────────────────────────────────────────
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+
+        run: python fetch_invoices.py
