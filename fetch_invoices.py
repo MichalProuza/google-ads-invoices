@@ -20,6 +20,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress verbose font subsetting logs from fpdf2/fonttools
+logging.getLogger("fontTools.subset").setLevel(logging.WARNING)
+logging.getLogger("fontTools").setLevel(logging.WARNING)
+
 
 def get_last_month_range() -> tuple[str, str]:
     """Returns (start_date, end_date) strings for the previous calendar month."""

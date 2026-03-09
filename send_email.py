@@ -124,6 +124,10 @@ def send_invoices_email(
 
     raw_message = _build_message(sender, to, subject, body, attachments)
 
+    # Calculate raw message size for logging
+    raw_size_mb = len(raw_message) / (1024 * 1024)
+    logger.info("Email message size: %.2f MB", raw_size_mb)
+
     try:
         result = (
             service.users()
@@ -134,4 +138,10 @@ def send_invoices_email(
         logger.info("Email sent successfully. Message ID: %s", result.get("id"))
     except HttpError as exc:
         logger.error("Failed to send email via Gmail API: %s", exc)
+        if exc.resp.status == 400:
+            logger.error(
+                "Hint: 'Precondition check failed' usually means the Gmail OAuth token "
+                "has expired (tokens for apps in 'testing' mode expire after 7 days). "
+                "Either regenerate GMAIL_TOKEN_JSON or publish the OAuth app in Google Cloud Console."
+            )
         raise
