@@ -130,6 +130,7 @@ def main():
     logger.info("Processing %d customer account(s): %s", len(customer_ids), customer_ids)
 
     # Initialize Google Ads client (reads google-ads.yaml or env vars)
+    os.environ.setdefault("GOOGLE_ADS_USE_PROTO_PLUS", "True")
     client = GoogleAdsClient.load_from_env()
 
     all_invoices = []
