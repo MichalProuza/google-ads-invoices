@@ -32,20 +32,55 @@ def get_last_month_range() -> tuple[str, str]:
     return last_month_start.strftime("%Y-%m-%d"), last_month_end.strftime("%Y-%m-%d")
 
 
+def _list_invoices_for_month(client, customer_id, billing_setup_resource, year, month):
+    """Call InvoiceService.list_invoices for a single year/month.
+
+    Returns a list of invoice objects (may be empty).
+    """
+    # MonthOfYearEnum: UNSPECIFIED=0, UNKNOWN=1, JANUARY=2 ... DECEMBER=13
+    issue_month = client.enums.MonthOfYearEnum(month + 1)
+    issue_year = str(year)
+
+    logger.info(
+        "Querying InvoiceService: customer=%s, billing_setup=%s, year=%s, month=%s",
+        customer_id, billing_setup_resource, issue_year, issue_month,
+    )
+
+    billing_service = client.get_service("InvoiceService")
+    try:
+        resp = billing_service.list_invoices(
+            customer_id=customer_id,
+            billing_setup=billing_setup_resource,
+            issue_year=issue_year,
+            issue_month=issue_month,
+        )
+        invoices = list(resp.invoices)
+        logger.info("InvoiceService returned %d invoice(s) for %s/%s", len(invoices), issue_year, month)
+        return invoices
+    except GoogleAdsException as ex:
+        logger.error("InvoiceService error for customer %s (%s/%s): %s",
+                      customer_id, issue_year, month, ex.failure)
+        return []
+
+
 def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> list[dict]:
     """
     Fetches actual invoices for the previous month via InvoiceService.
+    Tries all approved billing setups.  If no invoices found for the previous
+    month, also checks the current month (automatic-payment receipts may be
+    issued in the following month).
 
     Returns a list of dicts with keys: invoice_id, pdf_url, amount_micros,
     currency_code, customer_id.
     """
     ga_service = client.get_service("GoogleAdsService")
 
-    # Find active billing setup for this customer
+    # Find all active billing setups for this customer
     query = """
         SELECT
             billing_setup.id,
-            billing_setup.status
+            billing_setup.status,
+            billing_setup.payments_account
         FROM billing_setup
         WHERE billing_setup.status = 'APPROVED'
     """
@@ -60,42 +95,59 @@ def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> lis
         logger.warning("No approved billing setups found for customer %s", customer_id)
         return []
 
-    billing_setup_id = str(billing_setups[0].billing_setup.id)
-    logger.info("Using billing setup %s for customer %s", billing_setup_id, customer_id)
+    logger.info(
+        "Found %d approved billing setup(s) for customer %s: %s",
+        len(billing_setups), customer_id,
+        [str(bs.billing_setup.id) for bs in billing_setups],
+    )
 
-    # Determine previous month
+    # Determine months to query: previous month, and current month as fallback
     today = date.today()
     first_of_this_month = today.replace(day=1)
     last_month = first_of_this_month - relativedelta(months=1)
-    issue_year = str(last_month.year)
-    issue_month = client.enums.MonthOfYearEnum(last_month.month + 1)
 
-    billing_service = client.get_service("InvoiceService")
-    try:
-        invoice_response = billing_service.list_invoices(
-            customer_id=customer_id,
-            billing_setup=f"customers/{customer_id}/billingSetups/{billing_setup_id}",
-            issue_year=issue_year,
-            issue_month=issue_month,
-        )
-    except GoogleAdsException as ex:
-        logger.error("Failed to list invoices for customer %s: %s", customer_id, ex.failure)
-        return []
+    months_to_try = [
+        (last_month.year, last_month.month),
+        (today.year, today.month),
+    ]
 
     invoices = []
-    for invoice in invoice_response.invoices:
-        invoices.append({
-            "invoice_id": invoice.id,
-            "pdf_url": invoice.pdf_url,
-            "amount_micros": invoice.subtotal_amount_micros,
-            "currency_code": invoice.currency_code,
-            "customer_id": customer_id,
-        })
-        logger.info(
-            "Found invoice %s for customer %s (%.2f %s)",
-            invoice.id, customer_id,
-            invoice.subtotal_amount_micros / 1_000_000,
-            invoice.currency_code,
+    seen_ids = set()
+
+    for bs_row in billing_setups:
+        billing_setup_id = str(bs_row.billing_setup.id)
+        billing_setup_resource = f"customers/{customer_id}/billingSetups/{billing_setup_id}"
+        logger.info("Trying billing setup %s (payments_account: %s)",
+                     billing_setup_id, bs_row.billing_setup.payments_account)
+
+        for year, month in months_to_try:
+            raw_invoices = _list_invoices_for_month(
+                client, customer_id, billing_setup_resource, year, month,
+            )
+            for invoice in raw_invoices:
+                if invoice.id in seen_ids:
+                    continue
+                seen_ids.add(invoice.id)
+                invoices.append({
+                    "invoice_id": invoice.id,
+                    "pdf_url": invoice.pdf_url,
+                    "amount_micros": invoice.subtotal_amount_micros,
+                    "currency_code": invoice.currency_code,
+                    "customer_id": customer_id,
+                })
+                logger.info(
+                    "Found invoice %s for customer %s (%.2f %s)",
+                    invoice.id, customer_id,
+                    invoice.subtotal_amount_micros / 1_000_000,
+                    invoice.currency_code,
+                )
+
+    if not invoices:
+        logger.warning(
+            "No invoices returned by InvoiceService for customer %s. "
+            "This can happen if the account uses automatic payments and Google "
+            "has not yet issued a billing document for the queried period.",
+            customer_id,
         )
 
     return invoices
