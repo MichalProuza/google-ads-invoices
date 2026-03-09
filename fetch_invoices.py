@@ -1,11 +1,10 @@
 """
-Google Ads Invoice Downloader
-Downloads PDF invoices for the previous month from one or more Google Ads accounts
-and sends them via Gmail API.
+Google Ads Billing Report
+Fetches spending data for the previous month from one or more Google Ads accounts,
+generates PDF reports, and sends them via Gmail API.
 """
 
 import os
-import io
 import logging
 from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
@@ -31,94 +30,161 @@ def get_last_month_range() -> tuple[str, str]:
     return last_month_start.strftime("%Y-%m-%d"), last_month_end.strftime("%Y-%m-%d")
 
 
-def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> list[dict]:
+def fetch_spending_for_account(
+    client: GoogleAdsClient, customer_id: str, start_date: str, end_date: str
+) -> dict | None:
     """
-    Fetches invoices for the previous month for a single Google Ads customer.
+    Fetches account-level and campaign-level spending for a date range.
 
-    Returns a list of dicts with keys: invoice_id, invoice_date, pdf_url, amount
+    Returns a dict with account info and campaign breakdown, or None on error.
     """
-    billing_service = client.get_service("InvoiceService")
-    billing_setup_service = client.get_service("BillingSetupService")
-
-    # Find active billing setup IDs for this customer
     ga_service = client.get_service("GoogleAdsService")
-    query = """
+
+    # Account-level totals
+    account_query = f"""
         SELECT
-            billing_setup.id,
-            billing_setup.status,
-            billing_setup.payments_account_info.payments_account_id
-        FROM billing_setup
-        WHERE billing_setup.status = 'APPROVED'
+            customer.descriptive_name,
+            customer.id,
+            customer.currency_code,
+            metrics.cost_micros,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.conversions
+        FROM customer
+        WHERE segments.date >= '{start_date}'
+            AND segments.date <= '{end_date}'
     """
-    try:
-        response = ga_service.search(customer_id=customer_id, query=query)
-        billing_setups = list(response)
-    except GoogleAdsException as ex:
-        logger.error(
-            "GoogleAdsException for customer %s: %s", customer_id, ex.failure
-        )
-        return []
-
-    if not billing_setups:
-        logger.warning("No approved billing setups found for customer %s", customer_id)
-        return []
-
-    billing_setup_id = str(billing_setups[0].billing_setup.id)
-
-    # Determine previous month
-    today = date.today()
-    first_of_this_month = today.replace(day=1)
-    last_month = first_of_this_month - relativedelta(months=1)
-    issue_year = str(last_month.year)
-    # MonthOfYearEnum: UNSPECIFIED=0, UNKNOWN=1, JANUARY=2, …, DECEMBER=13
-    # Python's date.month is 1-12, so we need +1 to align.
-    issue_month = client.enums.MonthOfYearEnum(last_month.month + 1).name
 
     try:
-        invoice_response = billing_service.list_invoices(
-            customer_id=customer_id,
-            billing_setup=f"customers/{customer_id}/billingSetups/{billing_setup_id}",
-            issue_year=issue_year,
-            issue_month=issue_month,
-        )
+        account_response = ga_service.search(customer_id=customer_id, query=account_query)
+        account_rows = list(account_response)
     except GoogleAdsException as ex:
-        logger.error(
-            "Failed to list invoices for customer %s: %s", customer_id, ex.failure
-        )
-        return []
+        logger.error("Failed to fetch account data for %s: %s", customer_id, ex.failure)
+        return None
 
-    invoices = []
-    for invoice in invoice_response.invoices:
-        invoices.append(
-            {
-                "invoice_id": invoice.id,
-                "invoice_date": f"{issue_year}-{last_month.month:02d}",
-                "pdf_url": invoice.pdf_download_url,
-                "amount_micros": invoice.subtotal_amount_micros,
-                "currency_code": invoice.currency_code,
-                "customer_id": customer_id,
-            }
-        )
-        logger.info(
-            "Found invoice %s for customer %s (%s %s)",
-            invoice.id,
-            customer_id,
-            invoice.subtotal_amount_micros / 1_000_000,
-            invoice.currency_code,
-        )
+    if not account_rows:
+        logger.warning("No spending data for customer %s in %s – %s", customer_id, start_date, end_date)
+        return None
 
-    return invoices
+    row = account_rows[0]
+    account_name = row.customer.descriptive_name or f"Account {customer_id}"
+    currency = row.customer.currency_code
+    total_cost_micros = row.metrics.cost_micros
+    total_impressions = row.metrics.impressions
+    total_clicks = row.metrics.clicks
+    total_conversions = row.metrics.conversions
+
+    # Campaign-level breakdown
+    campaign_query = f"""
+        SELECT
+            campaign.name,
+            campaign.id,
+            metrics.cost_micros,
+            metrics.impressions,
+            metrics.clicks,
+            metrics.conversions
+        FROM campaign
+        WHERE segments.date >= '{start_date}'
+            AND segments.date <= '{end_date}'
+            AND metrics.cost_micros > 0
+        ORDER BY metrics.cost_micros DESC
+    """
+
+    campaigns = []
+    try:
+        campaign_response = ga_service.search(customer_id=customer_id, query=campaign_query)
+        for crow in campaign_response:
+            campaigns.append({
+                "name": crow.campaign.name,
+                "id": crow.campaign.id,
+                "cost_micros": crow.metrics.cost_micros,
+                "impressions": crow.metrics.impressions,
+                "clicks": crow.metrics.clicks,
+                "conversions": crow.metrics.conversions,
+            })
+    except GoogleAdsException as ex:
+        logger.warning("Failed to fetch campaign data for %s: %s", customer_id, ex.failure)
+
+    return {
+        "customer_id": customer_id,
+        "account_name": account_name,
+        "currency": currency,
+        "total_cost_micros": total_cost_micros,
+        "total_impressions": total_impressions,
+        "total_clicks": total_clicks,
+        "total_conversions": total_conversions,
+        "campaigns": campaigns,
+    }
 
 
-def download_invoice_pdf(pdf_url: str, session) -> bytes:
-    """Downloads the PDF from the given URL and returns raw bytes."""
-    response = session.get(pdf_url)
-    response.raise_for_status()
-    return response.content
+def generate_pdf_report(account_data: dict, start_date: str, end_date: str) -> bytes:
+    """Generates a PDF spending report for a single account."""
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    currency = account_data["currency"]
+    total_cost = account_data["total_cost_micros"] / 1_000_000
+
+    # Title
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.cell(0, 10, "Google Ads Billing Report", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(4)
+
+    # Account info
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, f"Account: {account_data['account_name']} ({account_data['customer_id']})", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Period: {start_date}  -  {end_date}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Summary
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 9, "Summary", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 11)
+    pdf.cell(0, 7, f"Total Cost: {total_cost:,.2f} {currency}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Impressions: {account_data['total_impressions']:,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Clicks: {account_data['total_clicks']:,}", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 7, f"Conversions: {account_data['total_conversions']:,.1f}", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    # Campaign breakdown table
+    campaigns = account_data["campaigns"]
+    if campaigns:
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(0, 9, "Campaign Breakdown", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
+        # Table header
+        col_widths = [70, 30, 25, 25, 25]
+        headers = ["Campaign", f"Cost ({currency})", "Impr.", "Clicks", "Conv."]
+        pdf.set_font("Helvetica", "B", 9)
+        for w, h in zip(col_widths, headers):
+            pdf.cell(w, 7, h, border=1)
+        pdf.ln()
+
+        # Table rows
+        pdf.set_font("Helvetica", "", 9)
+        for c in campaigns:
+            name = c["name"][:40] + ("..." if len(c["name"]) > 40 else "")
+            cost = f"{c['cost_micros'] / 1_000_000:,.2f}"
+            pdf.cell(col_widths[0], 7, name, border=1)
+            pdf.cell(col_widths[1], 7, cost, border=1, align="R")
+            pdf.cell(col_widths[2], 7, f"{c['impressions']:,}", border=1, align="R")
+            pdf.cell(col_widths[3], 7, f"{c['clicks']:,}", border=1, align="R")
+            pdf.cell(col_widths[4], 7, f"{c['conversions']:,.1f}", border=1, align="R")
+            pdf.ln()
+
+    # Footer
+    pdf.ln(8)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.cell(0, 5, f"Generated automatically on {date.today().isoformat()}", new_x="LMARGIN", new_y="NEXT", align="C")
+
+    return pdf.output()
 
 
 def main():
-    # --- Configuration from environment variables ---
     customer_ids_raw = os.environ.get("GOOGLE_ADS_CUSTOMER_IDS", "")
     recipient_email = os.environ.get("RECIPIENT_EMAIL", "")
 
@@ -127,59 +193,53 @@ def main():
     if not recipient_email:
         raise ValueError("RECIPIENT_EMAIL environment variable is not set.")
 
-    # Support comma-separated list: "1234567890,9876543210"
     customer_ids = [cid.strip().replace("-", "") for cid in customer_ids_raw.split(",") if cid.strip()]
     logger.info("Processing %d customer account(s): %s", len(customer_ids), customer_ids)
 
-    # Initialize Google Ads client (reads google-ads.yaml or env vars)
     os.environ.setdefault("GOOGLE_ADS_USE_PROTO_PLUS", "True")
     client = GoogleAdsClient.load_from_env()
 
-    all_invoices = []
-    for customer_id in customer_ids:
-        logger.info("Fetching invoices for customer %s ...", customer_id)
-        invoices = fetch_invoices_for_account(client, customer_id)
-        all_invoices.extend(invoices)
-
-    if not all_invoices:
-        logger.warning("No invoices found for any account. Nothing to send.")
-        return
-
-    # Download PDFs
-    import requests
-    from google.auth.transport.requests import Request
-    from google.oauth2 import service_account
-
-    # Use the Google Ads API credentials to authenticate the download requests
-    credentials = client.oauth2_credentials
-    if hasattr(credentials, "refresh"):
-        credentials.refresh(Request())
-
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {credentials.token}"})
+    start_date, end_date = get_last_month_range()
+    period_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%B %Y")
 
     attachments = []
-    for inv in all_invoices:
-        logger.info("Downloading PDF for invoice %s ...", inv["invoice_id"])
-        try:
-            pdf_bytes = download_invoice_pdf(inv["pdf_url"], session)
-            filename = f"invoice_{inv['customer_id']}_{inv['invoice_date']}_{inv['invoice_id']}.pdf"
-            attachments.append({"filename": filename, "data": pdf_bytes, "mimetype": "application/pdf"})
-        except Exception as exc:
-            logger.error("Failed to download PDF for invoice %s: %s", inv["invoice_id"], exc)
+    summary_lines = []
+
+    for customer_id in customer_ids:
+        logger.info("Fetching spending data for customer %s ...", customer_id)
+        data = fetch_spending_for_account(client, customer_id, start_date, end_date)
+        if data is None:
+            continue
+
+        total_cost = data["total_cost_micros"] / 1_000_000
+        logger.info(
+            "Customer %s (%s): %,.2f %s",
+            customer_id, data["account_name"], total_cost, data["currency"],
+        )
+
+        summary_lines.append(
+            f"  - {data['account_name']} ({customer_id}): "
+            f"{total_cost:,.2f} {data['currency']}"
+        )
+
+        # Generate PDF report
+        logger.info("Generating PDF report for customer %s ...", customer_id)
+        pdf_bytes = generate_pdf_report(data, start_date, end_date)
+        filename = f"google_ads_report_{customer_id}_{start_date[:7]}.pdf"
+        attachments.append({"filename": filename, "data": pdf_bytes, "mimetype": "application/pdf"})
 
     if not attachments:
-        logger.error("All PDF downloads failed. No email will be sent.")
+        logger.warning("No spending data found for any account. Nothing to send.")
         return
 
-    start_date, end_date = get_last_month_range()
-    subject = f"Google Ads Invoices – {datetime.strptime(start_date, '%Y-%m-%d').strftime('%B %Y')}"
+    subject = f"Google Ads Billing Report – {period_label}"
     body = (
         f"Hi,\n\n"
-        f"Please find attached the Google Ads invoice(s) for the period "
-        f"{start_date} – {end_date}.\n\n"
-        f"Accounts processed: {', '.join(customer_ids)}\n"
-        f"Invoices attached: {len(attachments)}\n\n"
+        f"Please find attached the Google Ads billing report(s) for {period_label} "
+        f"({start_date} – {end_date}).\n\n"
+        f"Accounts:\n"
+        + "\n".join(summary_lines)
+        + f"\n\nReports attached: {len(attachments)}\n\n"
         f"This message was generated automatically.\n"
     )
 
