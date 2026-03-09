@@ -55,7 +55,7 @@ def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> lis
         billing_setups = list(response)
     except GoogleAdsException as ex:
         logger.error(
-            "GoogleAdsException for customer %s: %s", customer_id, ex.error.message
+            "GoogleAdsException for customer %s: %s", customer_id, ex.failure
         )
         return []
 
@@ -81,7 +81,7 @@ def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> lis
         )
     except GoogleAdsException as ex:
         logger.error(
-            "Failed to list invoices for customer %s: %s", customer_id, ex.error.message
+            "Failed to list invoices for customer %s: %s", customer_id, ex.failure
         )
         return []
 
