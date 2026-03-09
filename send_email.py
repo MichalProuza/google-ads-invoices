@@ -65,9 +65,20 @@ def _get_gmail_credentials() -> Credentials:
         scopes=SCOPES,
     )
 
-    if creds.expired and creds.refresh_token:
-        logger.info("Gmail token expired, refreshing ...")
-        creds.refresh(Request())
+    # Always refresh when a refresh_token is available.
+    # Credentials constructed without an expiry field report expired=False
+    # even when the access token is actually stale, so we cannot rely on
+    # the `creds.expired` flag alone.
+    if creds.refresh_token:
+        logger.info("Refreshing Gmail access token ...")
+        try:
+            creds.refresh(Request())
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to refresh Gmail token. If the OAuth app is in 'testing' mode, "
+                "refresh tokens expire after 7 days – regenerate GMAIL_TOKEN_JSON or "
+                "publish the app in Google Cloud Console."
+            ) from exc
 
     return creds
 
@@ -124,6 +135,10 @@ def send_invoices_email(
 
     raw_message = _build_message(sender, to, subject, body, attachments)
 
+    # Calculate raw message size for logging
+    raw_size_mb = len(raw_message) / (1024 * 1024)
+    logger.info("Email message size: %.2f MB", raw_size_mb)
+
     try:
         result = (
             service.users()
@@ -134,4 +149,10 @@ def send_invoices_email(
         logger.info("Email sent successfully. Message ID: %s", result.get("id"))
     except HttpError as exc:
         logger.error("Failed to send email via Gmail API: %s", exc)
+        if exc.resp.status == 400:
+            logger.error(
+                "Hint: 'Precondition check failed' usually means the Gmail OAuth token "
+                "has expired (tokens for apps in 'testing' mode expire after 7 days). "
+                "Either regenerate GMAIL_TOKEN_JSON or publish the OAuth app in Google Cloud Console."
+            )
         raise
