@@ -117,6 +117,19 @@ def fetch_spending_for_account(
     }
 
 
+def _find_font_path() -> str | None:
+    """Find DejaVu Sans TTF font on the system."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return os.path.dirname(path)
+    return None
+
+
 def generate_pdf_report(account_data: dict, start_date: str, end_date: str) -> bytes:
     """Generates a PDF spending report for a single account."""
     from fpdf import FPDF
@@ -125,24 +138,33 @@ def generate_pdf_report(account_data: dict, start_date: str, end_date: str) -> b
     pdf.add_page()
     pdf.set_auto_page_break(auto=True, margin=15)
 
+    # Use DejaVu Sans for Unicode (Czech characters) support
+    font_dir = _find_font_path()
+    if font_dir:
+        pdf.add_font("DejaVu", "", os.path.join(font_dir, "DejaVuSans.ttf"))
+        pdf.add_font("DejaVu", "B", os.path.join(font_dir, "DejaVuSans-Bold.ttf"))
+        font_family = "DejaVu"
+    else:
+        font_family = "Helvetica"
+
     currency = account_data["currency"]
     total_cost = account_data["total_cost_micros"] / 1_000_000
 
     # Title
-    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_font(font_family, "B", 16)
     pdf.cell(0, 10, "Google Ads Billing Report", new_x="LMARGIN", new_y="NEXT", align="C")
     pdf.ln(4)
 
     # Account info
-    pdf.set_font("Helvetica", "", 11)
+    pdf.set_font(font_family, "", 11)
     pdf.cell(0, 7, f"Account: {account_data['account_name']} ({account_data['customer_id']})", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Period: {start_date}  -  {end_date}", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(4)
 
     # Summary
-    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_font(font_family, "B", 13)
     pdf.cell(0, 9, "Summary", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 11)
+    pdf.set_font(font_family, "", 11)
     pdf.cell(0, 7, f"Total Cost: {total_cost:,.2f} {currency}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Impressions: {account_data['total_impressions']:,}", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 7, f"Clicks: {account_data['total_clicks']:,}", new_x="LMARGIN", new_y="NEXT")
@@ -152,20 +174,20 @@ def generate_pdf_report(account_data: dict, start_date: str, end_date: str) -> b
     # Campaign breakdown table
     campaigns = account_data["campaigns"]
     if campaigns:
-        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_font(font_family, "B", 13)
         pdf.cell(0, 9, "Campaign Breakdown", new_x="LMARGIN", new_y="NEXT")
         pdf.ln(2)
 
         # Table header
         col_widths = [70, 30, 25, 25, 25]
         headers = ["Campaign", f"Cost ({currency})", "Impr.", "Clicks", "Conv."]
-        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_font(font_family, "B", 9)
         for w, h in zip(col_widths, headers):
             pdf.cell(w, 7, h, border=1)
         pdf.ln()
 
         # Table rows
-        pdf.set_font("Helvetica", "", 9)
+        pdf.set_font(font_family, "", 9)
         for c in campaigns:
             name = c["name"][:40] + ("..." if len(c["name"]) > 40 else "")
             cost = f"{c['cost_micros'] / 1_000_000:,.2f}"
@@ -178,7 +200,7 @@ def generate_pdf_report(account_data: dict, start_date: str, end_date: str) -> b
 
     # Footer
     pdf.ln(8)
-    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_font(font_family, "", 8)
     pdf.cell(0, 5, f"Generated automatically on {date.today().isoformat()}", new_x="LMARGIN", new_y="NEXT", align="C")
 
     return pdf.output()
@@ -213,7 +235,7 @@ def main():
 
         total_cost = data["total_cost_micros"] / 1_000_000
         logger.info(
-            "Customer %s (%s): %,.2f %s",
+            "Customer %s (%s): %.2f %s",
             customer_id, data["account_name"], total_cost, data["currency"],
         )
 
