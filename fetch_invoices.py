@@ -70,7 +70,9 @@ def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> lis
     first_of_this_month = today.replace(day=1)
     last_month = first_of_this_month - relativedelta(months=1)
     issue_year = str(last_month.year)
-    issue_month = client.enums.MonthOfYearEnum(last_month.month).name
+    # MonthOfYearEnum: UNSPECIFIED=0, UNKNOWN=1, JANUARY=2, …, DECEMBER=13
+    # Python's date.month is 1-12, so we need +1 to align.
+    issue_month = client.enums.MonthOfYearEnum(last_month.month + 1).name
 
     try:
         invoice_response = billing_service.list_invoices(
