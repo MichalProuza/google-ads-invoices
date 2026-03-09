@@ -133,6 +133,21 @@ def send_invoices_email(
     creds = _get_gmail_credentials()
     service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
+    # Verify the authenticated account matches SENDER_EMAIL
+    try:
+        profile = service.users().getProfile(userId="me").execute()
+        authenticated_email = profile.get("emailAddress", "")
+        logger.info("Authenticated Gmail account: %s", authenticated_email)
+        if authenticated_email.lower() != sender.lower():
+            logger.warning(
+                "SENDER_EMAIL (%s) does not match authenticated account (%s). "
+                "This may cause 'Precondition check failed' errors.",
+                sender,
+                authenticated_email,
+            )
+    except HttpError as exc:
+        logger.warning("Could not verify Gmail profile: %s", exc)
+
     raw_message = _build_message(sender, to, subject, body, attachments)
 
     # Calculate raw message size for logging
