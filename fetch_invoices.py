@@ -1,7 +1,9 @@
 """
-Google Ads Invoice Downloader
-Fetches actual invoices (PDF) for the previous month from one or more Google Ads
-accounts via InvoiceService and sends them via Gmail API.
+Google Ads – monthly spending reminder.
+
+Queries the previous month's spending per campaign from one or more Google Ads
+accounts and sends a summary email with a direct link to the billing documents
+page so the accountant can download the official tax receipts.
 """
 
 import os
@@ -9,8 +11,6 @@ import logging
 from datetime import date, datetime
 from dateutil.relativedelta import relativedelta
 
-import requests
-from google.auth.transport.requests import Request
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
@@ -22,6 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+BILLING_DOCS_URL = "https://ads.google.com/aw/billing/documents"
+
 
 def get_last_month_range() -> tuple[str, str]:
     """Returns (start_date, end_date) strings for the previous calendar month."""
@@ -32,137 +34,88 @@ def get_last_month_range() -> tuple[str, str]:
     return last_month_start.strftime("%Y-%m-%d"), last_month_end.strftime("%Y-%m-%d")
 
 
-def _list_invoices_for_month(client, customer_id, billing_setup_resource, year, month):
-    """Call InvoiceService.list_invoices for a single year/month.
-
-    Returns a list of invoice objects (may be empty).
+def fetch_spending_for_account(
+    client: GoogleAdsClient, customer_id: str, start_date: str, end_date: str
+) -> dict:
     """
-    # MonthOfYearEnum: UNSPECIFIED=0, UNKNOWN=1, JANUARY=2 ... DECEMBER=13
-    issue_month = client.enums.MonthOfYearEnum(month + 1)
-    issue_year = str(year)
+    Queries total and per-campaign spending for the given date range.
 
-    logger.info(
-        "Querying InvoiceService: customer=%s, billing_setup=%s, year=%s, month=%s",
-        customer_id, billing_setup_resource, issue_year, issue_month,
-    )
-
-    billing_service = client.get_service("InvoiceService")
-    try:
-        resp = billing_service.list_invoices(
-            customer_id=customer_id,
-            billing_setup=billing_setup_resource,
-            issue_year=issue_year,
-            issue_month=issue_month,
-        )
-        invoices = list(resp.invoices)
-        logger.info("InvoiceService returned %d invoice(s) for %s/%s", len(invoices), issue_year, month)
-        return invoices
-    except GoogleAdsException as ex:
-        logger.error("InvoiceService error for customer %s (%s/%s): %s",
-                      customer_id, issue_year, month, ex.failure)
-        return []
-
-
-def fetch_invoices_for_account(client: GoogleAdsClient, customer_id: str) -> list[dict]:
-    """
-    Fetches actual invoices for the previous month via InvoiceService.
-    Tries all approved billing setups.  If no invoices found for the previous
-    month, also checks the current month (automatic-payment receipts may be
-    issued in the following month).
-
-    Returns a list of dicts with keys: invoice_id, pdf_url, amount_micros,
-    currency_code, customer_id.
+    Returns a dict:
+        {
+            "customer_id": str,
+            "account_name": str,
+            "total_micros": int,
+            "currency": str,
+            "campaigns": [{"name": str, "cost_micros": int}, ...],
+        }
     """
     ga_service = client.get_service("GoogleAdsService")
 
-    # Find all active billing setups for this customer
-    query = """
+    # Account-level total
+    account_query = f"""
         SELECT
-            billing_setup.id,
-            billing_setup.status,
-            billing_setup.payments_account
-        FROM billing_setup
-        WHERE billing_setup.status = 'APPROVED'
+            customer.descriptive_name,
+            metrics.cost_micros
+        FROM customer
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
     """
+    total_micros = 0
+    account_name = customer_id
+    currency = "CZK"
+
     try:
-        response = ga_service.search(customer_id=customer_id, query=query)
-        billing_setups = list(response)
+        response = ga_service.search(customer_id=customer_id, query=account_query)
+        for row in response:
+            account_name = row.customer.descriptive_name or customer_id
+            total_micros += row.metrics.cost_micros
     except GoogleAdsException as ex:
-        logger.error("Failed to query billing setups for customer %s: %s", customer_id, ex.failure)
-        return []
+        logger.error("Failed to query account spending for %s: %s", customer_id, ex.failure)
+        return {}
 
-    if not billing_setups:
-        logger.warning("No approved billing setups found for customer %s", customer_id)
-        return []
+    # Per-campaign breakdown
+    campaign_query = f"""
+        SELECT
+            campaign.name,
+            metrics.cost_micros
+        FROM campaign
+        WHERE segments.date BETWEEN '{start_date}' AND '{end_date}'
+            AND metrics.cost_micros > 0
+        ORDER BY metrics.cost_micros DESC
+    """
+    campaigns = []
+    try:
+        response = ga_service.search(customer_id=customer_id, query=campaign_query)
+        for row in response:
+            campaigns.append({
+                "name": row.campaign.name,
+                "cost_micros": row.metrics.cost_micros,
+            })
+            currency = "CZK"  # Google Ads API returns cost in account currency
+    except GoogleAdsException as ex:
+        logger.warning("Failed to query campaign spending for %s: %s", customer_id, ex.failure)
 
-    logger.info(
-        "Found %d approved billing setup(s) for customer %s: %s",
-        len(billing_setups), customer_id,
-        [str(bs.billing_setup.id) for bs in billing_setups],
-    )
+    # Try to get actual currency from account settings
+    try:
+        currency_query = "SELECT customer.currency_code FROM customer LIMIT 1"
+        response = ga_service.search(customer_id=customer_id, query=currency_query)
+        for row in response:
+            currency = row.customer.currency_code
+    except GoogleAdsException:
+        pass
 
-    # Determine months to query: previous month, and current month as fallback
-    today = date.today()
-    first_of_this_month = today.replace(day=1)
-    last_month = first_of_this_month - relativedelta(months=1)
-
-    months_to_try = [
-        (last_month.year, last_month.month),
-        (today.year, today.month),
-    ]
-
-    invoices = []
-    seen_ids = set()
-
-    for bs_row in billing_setups:
-        billing_setup_id = str(bs_row.billing_setup.id)
-        billing_setup_resource = f"customers/{customer_id}/billingSetups/{billing_setup_id}"
-        logger.info("Trying billing setup %s (payments_account: %s)",
-                     billing_setup_id, bs_row.billing_setup.payments_account)
-
-        for year, month in months_to_try:
-            raw_invoices = _list_invoices_for_month(
-                client, customer_id, billing_setup_resource, year, month,
-            )
-            for invoice in raw_invoices:
-                if invoice.id in seen_ids:
-                    continue
-                seen_ids.add(invoice.id)
-                invoices.append({
-                    "invoice_id": invoice.id,
-                    "pdf_url": invoice.pdf_url,
-                    "amount_micros": invoice.subtotal_amount_micros,
-                    "currency_code": invoice.currency_code,
-                    "customer_id": customer_id,
-                })
-                logger.info(
-                    "Found invoice %s for customer %s (%.2f %s)",
-                    invoice.id, customer_id,
-                    invoice.subtotal_amount_micros / 1_000_000,
-                    invoice.currency_code,
-                )
-
-    if not invoices:
-        logger.warning(
-            "No invoices returned by InvoiceService for customer %s. "
-            "This can happen if the account uses automatic payments and Google "
-            "has not yet issued a billing document for the queried period.",
-            customer_id,
-        )
-
-    return invoices
+    return {
+        "customer_id": customer_id,
+        "account_name": account_name,
+        "total_micros": total_micros,
+        "currency": currency,
+        "campaigns": campaigns,
+    }
 
 
-def download_invoice_pdf(pdf_url: str, credentials) -> bytes:
-    """Downloads the invoice PDF from the given URL using OAuth2 credentials."""
-    if hasattr(credentials, "refresh"):
-        credentials.refresh(Request())
-
-    session = requests.Session()
-    session.headers["Authorization"] = f"Bearer {credentials.token}"
-    response = session.get(pdf_url)
-    response.raise_for_status()
-    return response.content
+def format_czk(micros: int) -> str:
+    """Formats micros amount as a human-readable string with CZK-style formatting."""
+    amount = micros / 1_000_000
+    return f"{amount:,.2f}".replace(",", " ")
 
 
 def main():
@@ -183,56 +136,59 @@ def main():
     start_date, end_date = get_last_month_range()
     period_label = datetime.strptime(start_date, "%Y-%m-%d").strftime("%B %Y")
 
-    attachments = []
-    summary_lines = []
+    account_sections = []
+    has_spending = False
 
     for customer_id in customer_ids:
-        logger.info("Fetching invoices for customer %s ...", customer_id)
-        invoices = fetch_invoices_for_account(client, customer_id)
+        logger.info("Fetching spending for customer %s ...", customer_id)
+        spending = fetch_spending_for_account(client, customer_id, start_date, end_date)
 
-        if not invoices:
-            logger.warning("No invoices found for customer %s", customer_id)
+        if not spending:
+            logger.warning("Could not retrieve spending for customer %s", customer_id)
             continue
 
-        credentials = client.oauth2_credentials
-        for inv in invoices:
-            try:
-                logger.info("Downloading invoice PDF %s ...", inv["invoice_id"])
-                pdf_bytes = download_invoice_pdf(inv["pdf_url"], credentials)
-                filename = f"invoice_{customer_id}_{inv['invoice_id']}.pdf"
-                attachments.append({
-                    "filename": filename,
-                    "data": pdf_bytes,
-                    "mimetype": "application/pdf",
-                })
-                summary_lines.append(
-                    f"  - Faktura {inv['invoice_id']} ({customer_id}): "
-                    f"{inv['amount_micros'] / 1_000_000:,.2f} {inv['currency_code']}"
-                )
-            except Exception as ex:
-                logger.error("Failed to download invoice %s: %s", inv["invoice_id"], ex)
+        cid_formatted = f"{customer_id[:3]}-{customer_id[3:6]}-{customer_id[6:]}"
+        docs_link = f"{BILLING_DOCS_URL}?ocid={customer_id}"
 
-    if not attachments:
-        logger.warning("No invoices found for any account. Nothing to send.")
+        section = (
+            f"Účet: {spending['account_name']} ({cid_formatted})\n"
+            f"  Celková útrata: {format_czk(spending['total_micros'])} {spending['currency']}\n"
+        )
+
+        if spending["campaigns"]:
+            section += "  Kampaně:\n"
+            for c in spending["campaigns"]:
+                section += f"    - {c['name']}: {format_czk(c['cost_micros'])} {spending['currency']}\n"
+
+        section += f"\n  Daňové doklady ke stažení:\n  {docs_link}\n"
+
+        account_sections.append(section)
+        if spending["total_micros"] > 0:
+            has_spending = True
+
+    if not account_sections:
+        logger.warning("No spending data for any account. Nothing to send.")
         return
 
-    subject = f"Google Ads faktury – {period_label}"
+    subject = f"Google Ads – přehled útrat za {period_label}"
     body = (
         f"Dobrý den,\n\n"
-        f"v příloze naleznete faktury z Google Ads za období {period_label} "
-        f"({start_date} – {end_date}).\n\n"
-        f"Faktury:\n"
-        + "\n".join(summary_lines)
-        + f"\n\nCelkem příloh: {len(attachments)}\n\n"
-        f"Tato zpráva byla vygenerována automaticky.\n"
+        f"přehled útrat z Google Ads za období {period_label} "
+        f"({start_date} – {end_date}):\n\n"
+        + "\n".join(account_sections)
+        + "\n"
+        + "─" * 50 + "\n"
+        + "Připomínka: Nezapomeňte stáhnout oficiální daňové doklady\n"
+        + "z Google Ads (odkazy výše) a předat je do účetnictví.\n\n"
+        + "Tato zpráva byla vygenerována automaticky.\n"
     )
 
-    logger.info("Sending email to %s with %d invoice(s) ...", recipient_email, len(attachments))
+    logger.info("Sending reminder email to %s ...", recipient_email)
     send_invoices_email(
         to=recipient_email,
         subject=subject,
         body=body,
-        attachments=attachments,
+        attachments=[],
     )
     logger.info("Done.")
 
