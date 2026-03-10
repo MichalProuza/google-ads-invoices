@@ -1,14 +1,28 @@
-# Google Ads Invoice Automator
+# Google Ads – měsíční přehled útrat
 
-Automaticky stahuje PDF faktury z Google Ads za předchozí měsíc a odesílá je emailem přes Gmail API. Spouští se každý měsíc přes GitHub Actions.
+Automaticky odesílá měsíční email s přehledem útrat z Google Ads (celkově i po kampaních) a odkazem na stránku s oficiálními daňovými doklady. Spouští se každý měsíc přes GitHub Actions.
+
+---
+
+## Proč přehled útrat a ne PDF faktury?
+
+Původní záměr byl automaticky stahovat a posílat oficiální PDF faktury (daňové doklady) přímo z Google Ads API pomocí `InvoiceService`.
+
+**Zjistili jsme, že to není možné.** `InvoiceService` vrací faktury pouze pro účty nastavené na **měsíční fakturaci** (monthly invoicing). Naše účty používají **automatické platby** (platba 1. v měsíci + při dosažení limitu), a přepnutí na měsíční fakturaci není v našem případě dostupné.
+
+Pro účty s automatickými platbami neexistuje žádný způsob, jak oficiální daňové doklady získat přes Google Ads API. Tyto doklady jsou dostupné pouze ručně v Google Ads UI v sekci **Fakturace → Dokumenty**.
+
+**Aktuální řešení:** Skript posílá měsíční email s přehledem útrat a přímým odkazem do sekce dokumentů, aby účtárna věděla, že je čas doklady stáhnout.
 
 ---
 
 ## Jak to funguje
 
 1. Každý 5. v měsíci spustí GitHub Actions skript `fetch_invoices.py`
-2. Skript se připojí k Google Ads API a stáhne faktury za všechny nakonfigurované účty
-3. PDF soubory se odešlou jako přílohy emailu přes Gmail API
+2. Skript se připojí k Google Ads API a dotáže se na útraty za předchozí měsíc (celkem + po kampaních)
+3. Sestaví email s přehledem a odkazem na daňové doklady pro každý účet:
+   `https://ads.google.com/aw/billing/documents?ocid={customer_id}`
+4. Email odešle přes Gmail API
 
 ---
 
@@ -20,12 +34,6 @@ Automaticky stahuje PDF faktury z Google Ads za předchozí měsíc a odesílá 
 2. Vytvoř **OAuth 2.0 Client ID** (typ Desktop app)
 3. Požádej o **Developer Token** ve svém Google Ads účtu → Nástroje → API Center
 4. Vygeneruj refresh token pomocí [OAuth Playground](https://developers.google.com/oauthplayground/) nebo lokálního skriptu
-
-Tyto hodnoty budeš potřebovat jako GitHub Secrets:
-- `GOOGLE_ADS_DEVELOPER_TOKEN`
-- `GOOGLE_ADS_CLIENT_ID`
-- `GOOGLE_ADS_CLIENT_SECRET`
-- `GOOGLE_ADS_REFRESH_TOKEN`
 
 ### 2. Přihlašovací údaje Gmail API
 
@@ -55,7 +63,7 @@ Jdi do repozitáře → **Settings → Secrets and variables → Actions** a př
 | `GMAIL_CREDENTIALS_JSON` | Obsah JSON souboru s Gmail OAuth2 přihlašovacími údaji |
 | `GMAIL_TOKEN_JSON` | Token JSON vygenerovaný skriptem `generate_token.py` |
 | `SENDER_EMAIL` | Gmail adresa odesílatele |
-| `RECIPIENT_EMAIL` | Email adresa příjemce faktur |
+| `RECIPIENT_EMAIL` | Email adresa příjemce |
 
 ---
 
@@ -66,7 +74,7 @@ Workflow lze spustit ručně přes **GitHub Actions → Monthly Google Ads Invoi
 ## Struktura souborů
 
 ```
-├── fetch_invoices.py          # Hlavní skript – stahuje faktury a odesílá email
+├── fetch_invoices.py          # Hlavní skript – přehled útrat + reminder email
 ├── send_email.py              # Gmail API modul pro odesílání
 ├── generate_token.py          # Jednorázový lokální helper pro získání Gmail tokenu
 ├── requirements.txt
